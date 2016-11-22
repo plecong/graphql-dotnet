@@ -1,8 +1,10 @@
-﻿namespace GraphQL.Tests.StarWars
+﻿using Xunit;
+
+namespace GraphQL.Tests.StarWars
 {
-    public class StarWarsFragmentTests : QueryTestBase<StarWarsSchema>
+    public class StarWarsFragmentTests : StarWarsTestBase
     {
-        [Test]
+        [Fact]
         public void use_fragment_spread_to_avoid_duplicate_content()
         {
             var query = @"
@@ -32,13 +34,35 @@
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void use_inline_fragment_on_interface()
         {
             var query = @"
                query SomeDroids {
                   r2d2: droid(id: ""3"") {
                     ... on Character {
+                      name
+                    }
+                  }
+               }
+            ";
+
+            var expected = @"{
+              'r2d2': {
+                name: 'R2-D2'
+              },
+            }";
+
+            AssertQuerySuccess(query, expected);
+        }
+
+        [Fact]
+        public void use_unnamed_inline_fragment_on_interface()
+        {
+            var query = @"
+               query SomeDroids {
+                  r2d2: droid(id: ""3"") {
+                    ... {
                       name
                     }
                   }

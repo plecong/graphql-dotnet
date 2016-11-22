@@ -1,95 +1,174 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 
 namespace GraphQL.Types
 {
-    public class Schema
+    public interface ISchema : IDisposable
     {
+        bool Initialized { get; }
+
+        void Initialize();
+
+        IObjectGraphType Query { get; set; }
+
+        IObjectGraphType Mutation { get; set; }
+
+        IObjectGraphType Subscription { get; set; }
+
+        IEnumerable<DirectiveGraphType> Directives { get; set; }
+
+        IEnumerable<IGraphType> AllTypes { get; }
+
+        IGraphType FindType(string name);
+
+        IEnumerable<Type> AdditionalTypes { get; }
+
+        void RegisterTypes(params Type[] types);
+
+        void RegisterType<T>() where T : IGraphType;
+    }
+
+    public class Schema : ISchema
+    {
+        private readonly Lazy<GraphTypesLookup> _lookup;
+        private readonly List<Type> _additionalTypes;
+        private readonly List<IGraphType> _additionalInstances;
+        private readonly List<DirectiveGraphType> _directives;
+
         public Schema()
+            : this(type => (GraphType) Activator.CreateInstance(type))
         {
-            ResolveType = type => (GraphType)Activator.CreateInstance(type);
         }
 
-        private GraphTypesLookup _lookup;
+        public Schema(Func<Type, IGraphType> resolveType)
+        {
+            ResolveType = resolveType;
 
-        public ObjectGraphType Query { get; set; }
+            _lookup = new Lazy<GraphTypesLookup>(CreateTypesLookup);
+            _additionalTypes = new List<Type>();
+            _additionalInstances = new List<IGraphType>();
+            _directives = new List<DirectiveGraphType>
+            {
+                DirectiveGraphType.Include,
+                DirectiveGraphType.Skip,
+                DirectiveGraphType.Deprecated
+            };
+        }
 
-        public ObjectGraphType Mutation { get; set; }
+        public bool Initialized => _lookup.IsValueCreated;
 
-        public Func<Type, GraphType> ResolveType { get; set; }
+        public void Initialize()
+        {
+            FindType("abcd");
+        }
+
+        public IObjectGraphType Query { get; set; }
+
+        public IObjectGraphType Mutation { get; set; }
+
+        public IObjectGraphType Subscription { get; set; }
+
+        public Func<Type, IGraphType> ResolveType { get; set; }
 
         public IEnumerable<DirectiveGraphType> Directives
         {
             get
             {
-                return new List<DirectiveGraphType>
+                return _directives;
+            }
+            set
+            {
+                if (value == null)
                 {
-                    DirectiveGraphType.Include,
-                    DirectiveGraphType.Skip
-                };
+                    return;
+                }
+
+                _directives.Clear();
+                _directives.Fill(value);
             }
         }
 
-        public IEnumerable<GraphType> AllTypes
+        public IEnumerable<IGraphType> AllTypes =>
+            _lookup
+                .Value
+                .All()
+                .ToList();
+
+        public IEnumerable<Type> AdditionalTypes => _additionalTypes;
+
+        public void RegisterTypes(params IGraphType[] types)
         {
-            get
+            _additionalInstances.AddRange(types);
+        }
+
+        public void RegisterTypes(params Type[] types)
+        {
+            if (types == null)
             {
-                return _lookup
-                    .All()
-                    .Where(x => !(x is NonNullGraphType || x is ListGraphType))
-                    .ToList();
+                throw new ArgumentNullException(nameof(types));
+            }
+
+            types.Apply(RegisterType);
+        }
+
+        public void RegisterType<T>() where T : IGraphType
+        {
+            RegisterType(typeof(T));
+        }
+
+        public IGraphType FindType(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentOutOfRangeException(nameof(name), "A type name is required to lookup.");
+            }
+
+            return _lookup.Value[name];
+        }
+
+        public void Dispose()
+        {
+            ResolveType = null;
+            Query = null;
+            Mutation = null;
+            Subscription = null;
+            _additionalInstances.Clear();
+            _additionalTypes.Clear();
+
+            if (_lookup.IsValueCreated)
+            {
+                _lookup.Value.Clear();
             }
         }
 
-        public GraphType FindType(string name)
+        private void RegisterType(Type type)
         {
-            EnsureLookup();
-            return _lookup[name];
-        }
-
-        public GraphType FindType(Type type)
-        {
-            EnsureLookup();
-            return _lookup[type] ?? AddType(type);
-        }
-
-        public IEnumerable<GraphType> FindTypes(IEnumerable<Type> types)
-        {
-            return types.Select(FindType).ToList();
-        }
-
-        public IEnumerable<GraphType> FindImplemenationsOf(Type type)
-        {
-            return _lookup.FindImplemenationsOf(type);
-        }
-
-        private GraphType AddType(Type type)
-        {
-            var ctx = new TypeCollectionContext(ResolveType, (name, graphType) =>
+            if (!typeof (IGraphType).IsAssignableFrom(type))
             {
-                _lookup[name] = graphType;
-            });
-
-            var instance = ResolveType(type);
-            _lookup.AddType(instance, ctx);
-            return instance;
-        }
-
-        public void EnsureLookup()
-        {
-            if (_lookup == null)
-            {
-                _lookup = new GraphTypesLookup();
-
-                var ctx = new TypeCollectionContext(ResolveType, (name, graphType) =>
-                {
-                    _lookup[name] = graphType;
-                });
-
-                _lookup.AddType(Query, ctx);
-                _lookup.AddType(Mutation, ctx);
+                throw new ArgumentOutOfRangeException(nameof(type), "Type must be of GraphType.");
             }
+
+            _additionalTypes.Fill(type);
+        }
+
+        private GraphTypesLookup CreateTypesLookup()
+        {
+            var resolvedTypes = _additionalTypes.Select(t => ResolveType(t.GetNamedType())).ToList();
+
+            var types = _additionalInstances.Concat(
+                    new IGraphType[]
+                    {
+                        Query,
+                        Mutation,
+                        Subscription
+                    })
+                .Concat(resolvedTypes)
+                .Where(x => x != null)
+                .ToList();
+
+            return GraphTypesLookup.Create(types, _directives, ResolveType);
         }
     }
 }

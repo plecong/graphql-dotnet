@@ -1,8 +1,10 @@
-﻿namespace GraphQL.Tests.StarWars
+﻿using Xunit;
+
+namespace GraphQL.Tests.StarWars
 {
-    public class StarWarsIntrospectionTests : QueryTestBase<StarWarsSchema>
+    public class StarWarsIntrospectionTests : StarWarsTestBase
     {
-        [Test]
+        [Fact]
         public void provides_typename()
         {
             var query = "{ hero { __typename name } }";
@@ -12,12 +14,12 @@
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void allows_querying_schema_for_an_object_kind()
         {
             var query = @"
                 query IntrospectionDroidKindQuery {
-                  __type(name: 'Droid') {
+                  __type(name: ""Droid"") {
                     name,
                     kind
                   }
@@ -34,7 +36,7 @@
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void allows_querying_schema_for_an_interface_kind()
         {
             var query = @"
@@ -56,7 +58,7 @@
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void allows_querying_schema_for_possibleTypes_of_an_interface()
         {
             var query = @"
@@ -86,7 +88,7 @@
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void allows_querying_the_schema_for_object_fields()
         {
             var query = @"
@@ -150,7 +152,7 @@
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void allows_querying_the_schema_for_documentation()
         {
             var query = @"
@@ -171,7 +173,7 @@
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void allows_querying_the_schema()
         {
             var query = @"
@@ -192,16 +194,123 @@
             ";
             var expected = @"{
             '__schema': {
-              'queryType': { 'name':'Query', 'kind': 'OBJECT'},
+              'types': [
+                {
+                  'name': 'String',
+                  'kind': 'SCALAR'
+                },
+                {
+                  'name': 'Boolean',
+                  'kind': 'SCALAR'
+                },
+                {
+                  'name': 'Float',
+                  'kind': 'SCALAR'
+                },
+                {
+                  'name': 'Int',
+                  'kind': 'SCALAR'
+                },
+                {
+                  'name': 'ID',
+                  'kind': 'SCALAR'
+                },
+                {
+                  'name': 'Date',
+                  'kind': 'SCALAR'
+                },
+                {
+                  'name': 'Decimal',
+                  'kind': 'SCALAR'
+                },
+                {
+                  'name': '__Schema',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': '__Type',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': '__TypeKind',
+                  'kind': 'ENUM'
+                },
+                {
+                  'name': '__Field',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': '__InputValue',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': '__EnumValue',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': '__Directive',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': '__DirectiveLocation',
+                  'kind': 'ENUM'
+                },
+                {
+                  'name': 'Query',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': 'Character',
+                  'kind': 'INTERFACE'
+                },
+                {
+                  'name': 'Episode',
+                  'kind': 'ENUM'
+                },
+                {
+                  'name': 'Human',
+                  'kind': 'OBJECT'
+                },
+                {
+                  'name': 'Droid',
+                  'kind': 'OBJECT'
+                }
+              ],
+              'queryType': {
+                'name': 'Query',
+                'kind': 'OBJECT'
+              },
               'mutationType': null,
-              'directives': [],
+              'directives': [
+                {
+                  'name': 'include',
+                  'description': 'Directs the executor to include this field or fragment only when the \'if\' argument is true.',
+                  'onOperation': false,
+                  'onFragment': true,
+                  'onField': true
+                },
+                {
+                  'name': 'skip',
+                  'description': 'Directs the executor to skip this field or fragment when the \'if\' argument is true.',
+                  'onOperation': false,
+                  'onFragment': true,
+                  'onField': true
+                },
+                {
+                  'name': 'deprecated',
+                  'description': 'Marks an element of a GraphQL schema as no longer supported.',
+                  'onOperation': false,
+                  'onFragment': false,
+                  'onField': false
+                }
+              ]
             }
             }";
 
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void allows_querying_field_args()
         {
             var query = @"
@@ -230,49 +339,52 @@
             ";
             var expected = @"{
             '__schema': {
-              'queryType': { 'name':'Query', 'kind': 'OBJECT'},
-              'mutationType': null,
-              'directives': [],
+              'queryType': {
+                'fields': [
+                  {
+                    'name': 'hero',
+                    'args': []
+                  },
+                  {
+                    'name': 'human',
+                    'args': [
+                      {
+                        'name': 'id',
+                        'description': 'id of the human',
+                        'type': {
+                          'name': null,
+                          'kind': 'NON_NULL',
+                          'ofType': {
+                            'name': 'String',
+                            'kind': 'SCALAR'
+                          }
+                        },
+                        'defaultValue': null
+                      }
+                    ]
+                  },
+                  {
+                    'name': 'droid',
+                    'args': [
+                      {
+                        'name': 'id',
+                        'description': 'id of the droid',
+                        'type': {
+                          'name': null,
+                          'kind': 'NON_NULL',
+                          'ofType': {
+                            'name': 'String',
+                            'kind': 'SCALAR'
+                          }
+                        },
+                        'defaultValue': null
+                      }
+                    ]
+                  }
+                ]
+              }
             }
             }";
-
-            AssertQuerySuccess(query, expected);
-        }
-
-        [Test]
-        public void full_schema_query()
-        {
-            var query = @"
-            query SchemaIntrospectionQuery {
-              __schema {
-                queryType { name, kind }
-                types { 
-                    kind
-                    name
-                    description
-                    fields {
-                        name
-                        description
-                        type {
-                            name
-                            kind
-                        }
-                        isDeprecated
-                        deprecationReason
-                    }
-                }
-                mutationType { name }
-                directives {
-                  name
-                  description
-                  onOperation
-                  onFragment
-                  onField
-                }
-              }
-            }";
-
-            var expected = "{'__schema':''}";
 
             AssertQuerySuccess(query, expected);
         }

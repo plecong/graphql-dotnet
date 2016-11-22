@@ -2,19 +2,24 @@ using GraphQL.Types;
 
 namespace GraphQL.Introspection
 {
-    public class __EnumValue : ObjectGraphType
+    public class __EnumValue : ObjectGraphType<EnumValueDefinition>
     {
         public __EnumValue()
         {
             Name = "__EnumValue";
-            Field<NonNullGraphType<StringGraphType>>("name");
-            Field<StringGraphType>("description");
-            Field<NonNullGraphType<StringGraphType>>("isDeprecated", null, null, context =>
+            Description =
+                "One possible value for a given Enum. Enum values are unique values, not " +
+                "a placeholder for a string or numeric value. However an Enum value is " +
+                "returned in a JSON response as a string.";
+
+            Field(f => f.Name);
+            Field(f => f.Description, nullable: true);
+
+            Field<NonNullGraphType<StringGraphType>>("isDeprecated", resolve: context =>
             {
-                var enumValue = context.Source as EnumValue;
-                return enumValue != null && !string.IsNullOrWhiteSpace(enumValue.DeprecationReason);
+                return !string.IsNullOrWhiteSpace(context.Source?.DeprecationReason);
             });
-            Field<StringGraphType>("deprecationReason");
+            Field(f => f.DeprecationReason, nullable: true);
         }
     }
 }

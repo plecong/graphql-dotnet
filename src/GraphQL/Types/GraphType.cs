@@ -1,51 +1,67 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 
 namespace GraphQL.Types
 {
-    public abstract class GraphType
+    public abstract class GraphType : IGraphType
     {
-        private readonly List<FieldType> _fields = new List<FieldType>();
-
         public string Name { get; set; }
 
         public string Description { get; set; }
 
-        public IEnumerable<FieldType> Fields
+        public string DeprecationReason { get; set; }
+
+        public IDictionary<string, object> Metadata { get; set; } = new ConcurrentDictionary<string, object>();
+
+        public TType GetMetadata<TType>(string key, TType defaultValue = default(TType))
         {
-            get { return _fields; }
-            private set
+            if (!HasMetadata(key))
             {
-                _fields.Clear();
-                _fields.AddRange(value);
+                return defaultValue;
             }
+
+            object item;
+            if (Metadata.TryGetValue(key, out item))
+            {
+                return (TType) item;
+            }
+
+            return defaultValue;
         }
 
-        public void Field<TType>(
-            string name, 
-            string description = null, 
-            QueryArguments arguments = null,
-            Func<ResolveFieldContext, object> resolve = null)
-            where TType : GraphType
+        public bool HasMetadata(string key)
         {
-            if (_fields.Exists(x => x.Name == name))
-            {
-                throw new ArgumentOutOfRangeException("name", "A field with that name is already registered.");
-            }
-
-            _fields.Add(new FieldType
-            {
-                Name = name,
-                Type = typeof(TType),
-                Arguments = arguments,
-                Resolve = resolve
-            });
+            return Metadata?.ContainsKey(key) ?? false;
         }
 
         public virtual string CollectTypes(TypeCollectionContext context)
         {
+            if (string.IsNullOrWhiteSpace(Name))
+            {
+                Name = GetType().Name;
+            }
+
             return Name;
+        }
+
+        protected bool Equals(IGraphType other)
+        {
+            return string.Equals(Name, other.Name);
+        }
+
+        public override bool Equals(object obj)
+        {
+            if (ReferenceEquals(null, obj)) return false;
+            if (ReferenceEquals(this, obj)) return true;
+            if (obj.GetType() != GetType()) return false;
+
+            return Equals((IGraphType)obj);
+        }
+
+        public override int GetHashCode()
+        {
+            return Name?.GetHashCode() ?? 0;
         }
     }
 
@@ -55,14 +71,14 @@ namespace GraphQL.Types
     public class TypeCollectionContext
     {
         public TypeCollectionContext(
-            Func<Type, GraphType> resolver,
-            Action<string, GraphType> addType)
+            Func<Type, IGraphType> resolver,
+            Action<string, IGraphType, TypeCollectionContext> addType)
         {
             ResolveType = resolver;
             AddType = addType;
         }
 
-        public Func<Type, GraphType> ResolveType { get; private set; }
-        public Action<string, GraphType> AddType { get; private set; }
+        public Func<Type, IGraphType> ResolveType { get; private set; }
+        public Action<string, IGraphType, TypeCollectionContext> AddType { get; private set; }
     }
 }

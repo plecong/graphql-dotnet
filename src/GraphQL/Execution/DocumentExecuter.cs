@@ -1,179 +1,351 @@
-﻿using GraphQL.Execution;
-using GraphQL.Introspection;
-using GraphQL.Language;
-using GraphQL.Types;
-using GraphQL.Validation;
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
+using GraphQL.Execution;
+using GraphQL.Instrumentation;
+using GraphQL.Introspection;
+using GraphQL.Language.AST;
+using GraphQL.Resolvers;
+using GraphQL.Types;
+using GraphQL.Validation;
+using GraphQL.Validation.Complexity;
+using ExecutionContext = GraphQL.Execution.ExecutionContext;
+using Field = GraphQL.Language.AST.Field;
 
 namespace GraphQL
 {
     public interface IDocumentExecuter
     {
-        Task<ExecutionResult> ExecuteAsync(Schema schema, object root, string query, string operationName, Inputs inputs = null);
+        Task<ExecutionResult> ExecuteAsync(
+            ISchema schema,
+            object root,
+            string query,
+            string operationName,
+            Inputs inputs = null,
+            object userContext = null,
+            CancellationToken cancellationToken = default(CancellationToken),
+            IEnumerable<IValidationRule> rules = null);
+
+        Task<ExecutionResult> ExecuteAsync(ExecutionOptions options);
+        Task<ExecutionResult> ExecuteAsync(Action<ExecutionOptions> configure);
     }
 
     public class DocumentExecuter : IDocumentExecuter
     {
         private readonly IDocumentBuilder _documentBuilder;
         private readonly IDocumentValidator _documentValidator;
+        private readonly IComplexityAnalyzer _complexityAnalyzer;
 
         public DocumentExecuter()
-            : this(new AntlrDocumentBuilder(), new DocumentValidator())
+            : this(new GraphQLDocumentBuilder(), new DocumentValidator(), new ComplexityAnalyzer())
         {
         }
 
-        public DocumentExecuter(IDocumentBuilder documentBuilder, IDocumentValidator documentValidator)
+        public DocumentExecuter(IDocumentBuilder documentBuilder, IDocumentValidator documentValidator, IComplexityAnalyzer complexityAnalyzer)
         {
             _documentBuilder = documentBuilder;
             _documentValidator = documentValidator;
+            _complexityAnalyzer = complexityAnalyzer;
         }
 
-        public async Task<ExecutionResult> ExecuteAsync(Schema schema, object root, string query, string operationName, Inputs inputs = null)
+        public Task<ExecutionResult> ExecuteAsync(
+            ISchema schema,
+            object root,
+            string query,
+            string operationName,
+            Inputs inputs = null,
+            object userContext = null,
+            CancellationToken cancellationToken = default(CancellationToken),
+            IEnumerable<IValidationRule> rules = null)
         {
-            var document = _documentBuilder.Build(query);
-            var result = new ExecutionResult();
-
-            var validationResult = _documentValidator.IsValid(schema, document, operationName);
-
-            if (validationResult.IsValid)
+            return ExecuteAsync(new ExecutionOptions
             {
-                var context = BuildExecutionContext(schema, root, document, operationName, inputs);
+                Schema = schema,
+                Root = root,
+                Query = query,
+                OperationName = operationName,
+                Inputs = inputs,
+                UserContext = userContext,
+                CancellationToken = cancellationToken,
+                ValidationRules = rules
+            });
+        }
 
-                if (context.Errors.Any())
+        public Task<ExecutionResult> ExecuteAsync(Action<ExecutionOptions> configure)
+        {
+            var options = new ExecutionOptions();
+            configure(options);
+            return ExecuteAsync(options);
+        }
+
+        public async Task<ExecutionResult> ExecuteAsync(ExecutionOptions config)
+        {
+            var metrics = new Metrics();
+            metrics.Start(config.OperationName);
+
+            config.FieldMiddleware.ApplyTo(config.Schema);
+
+            var result = new ExecutionResult { Query = config.Query };
+            try
+            {
+                if (!config.Schema.Initialized)
                 {
-                    result.Errors = context.Errors;
-                    return result;
+                    using (metrics.Subject("schema", "Initializing schema"))
+                    {
+                        config.Schema.Initialize();
+                    }
                 }
 
-                result.Data = await ExecuteOperation(context);
-                result.Errors = context.Errors;
-            }
-            else
-            {
-                result.Data = null;
-                result.Errors = validationResult.Errors;
-            }
+                var document = config.Document;
+                using (metrics.Subject("document", "Building document"))
+                {
+                    if (document == null)
+                    {
+                        document = _documentBuilder.Build(config.Query);
+                    }
+                }
 
-            return result;
+                result.Document = document;
+
+                var operation = GetOperation(config.OperationName, document);
+                result.Operation = operation;
+                metrics.SetOperationName(operation?.Name);
+
+                if (config.ComplexityConfiguration != null)
+                {
+                    using (metrics.Subject("document", "Analyzing complexity"))
+                        _complexityAnalyzer.Validate(document, config.ComplexityConfiguration);
+                }
+
+                IValidationResult validationResult;
+                using (metrics.Subject("document", "Validating document"))
+                {
+                    validationResult = _documentValidator.Validate(
+                        config.Query,
+                        config.Schema,
+                        document,
+                        config.ValidationRules,
+                        config.UserContext);
+                }
+
+                foreach (var listener in config.Listeners)
+                {
+                    await listener.AfterValidationAsync(
+                            config.UserContext,
+                            validationResult,
+                            config.CancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                if (validationResult.IsValid)
+                {
+                    var context = BuildExecutionContext(
+                        config.Schema,
+                        config.Root,
+                        document,
+                        operation,
+                        config.Inputs,
+                        config.UserContext,
+                        config.CancellationToken,
+                        metrics);
+
+                    if (context.Errors.Any())
+                    {
+                        result.Errors = context.Errors;
+                        return result;
+                    }
+
+                    using (metrics.Subject("execution", "Executing operation"))
+                    {
+                        foreach (var listener in config.Listeners)
+                        {
+                            await listener.BeforeExecutionAsync(config.UserContext, config.CancellationToken).ConfigureAwait(false);
+                        }
+
+                        var task = ExecuteOperationAsync(context).ConfigureAwait(false);
+
+                        foreach (var listener in config.Listeners)
+                        {
+                            await listener.BeforeExecutionAwaitedAsync(config.UserContext, config.CancellationToken).ConfigureAwait(false);
+                        }
+
+                        result.Data = await task;
+
+                        foreach (var listener in config.Listeners)
+                        {
+                            await listener.AfterExecutionAsync(config.UserContext, config.CancellationToken).ConfigureAwait(false);
+                        }
+                    }
+
+                    if (context.Errors.Any())
+                    {
+                        result.Errors = context.Errors;
+                    }
+                }
+                else
+                {
+                    result.Data = null;
+                    result.Errors = validationResult.Errors;
+                }
+
+                return result;
+            }
+            catch (Exception exc)
+            {
+                if (result.Errors == null)
+                {
+                    result.Errors = new ExecutionErrors();
+                }
+
+                result.Data = null;
+                result.Errors.Add(new ExecutionError(exc.Message, exc));
+                return result;
+            }
+            finally
+            {
+                result.Perf = metrics.Finish().ToArray();
+            }
         }
 
         public ExecutionContext BuildExecutionContext(
-            Schema schema,
+            ISchema schema,
             object root,
             Document document,
-            string operationName,
-            Inputs inputs)
+            Operation operation,
+            Inputs inputs,
+            object userContext,
+            CancellationToken cancellationToken,
+            Metrics metrics)
         {
             var context = new ExecutionContext();
+            context.Document = document;
             context.Schema = schema;
-            context.RootObject = root;
-
-            var operation = !string.IsNullOrWhiteSpace(operationName)
-                ? document.Operations.WithName(operationName)
-                : document.Operations.FirstOrDefault();
-
-            if (operation == null)
-            {
-                context.Errors.Add(new ExecutionError("Unknown operation name: {0}".ToFormat(operationName)));
-                return context;
-            }
+            context.RootValue = root;
+            context.UserContext = userContext;
 
             context.Operation = operation;
-            context.Variables = GetVariableValues(schema, operation.Variables, inputs);
+            context.Variables = GetVariableValues(document, schema, operation.Variables, inputs);
             context.Fragments = document.Fragments;
+            context.CancellationToken = cancellationToken;
+
+            context.Metrics = metrics;
 
             return context;
         }
 
-        public Task<object> ExecuteOperation(ExecutionContext context)
+        private Operation GetOperation(string operationName, Document document)
         {
-            var rootType = GetOperationRootType(context.Schema, context.Operation);
-            var fields = CollectFields(context, rootType, context.Operation.Selections, null);
+            var operation = !string.IsNullOrWhiteSpace(operationName)
+                ? document.Operations.WithName(operationName)
+                : document.Operations.FirstOrDefault();
 
-            return ExecuteFields(context, rootType, context.RootObject, fields);
+            return operation;
         }
 
-        public async Task<object> ExecuteFields(ExecutionContext context, ObjectGraphType rootType, object source, Dictionary<string, Fields> fields)
+        public Task<Dictionary<string, object>> ExecuteOperationAsync(ExecutionContext context)
         {
-            return await fields.ToDictionaryAsync(
+            var rootType = GetOperationRootType(context.Document, context.Schema, context.Operation);
+            var fields = CollectFields(
+                context,
+                rootType,
+                context.Operation.SelectionSet,
+                new Dictionary<string, Fields>(),
+                new List<string>());
+
+            return ExecuteFieldsAsync(context, rootType, context.RootValue, fields);
+        }
+
+        public Task<Dictionary<string, object>> ExecuteFieldsAsync(ExecutionContext context, IObjectGraphType rootType, object source, Dictionary<string, Fields> fields)
+        {
+            return fields.ToDictionaryAsync<KeyValuePair<string, Fields>, string, ResolveFieldResult<object>, object>(
                 pair => pair.Key,
-                pair => ResolveField(context, rootType, source, pair.Value));
+                pair => ResolveFieldAsync(context, rootType, source, pair.Value));
         }
 
-        public async Task<object> ResolveField(ExecutionContext context, ObjectGraphType parentType, object source, Fields fields)
+        public async Task<ResolveFieldResult<object>> ResolveFieldAsync(ExecutionContext context, IObjectGraphType parentType, object source, Fields fields)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
+
+            var resolveResult = new ResolveFieldResult<object>
+            {
+                Skip = false
+            };
+
             var field = fields.First();
 
             var fieldDefinition = GetFieldDefinition(context.Schema, parentType, field);
             if (fieldDefinition == null)
             {
-                return null;
+                resolveResult.Skip = true;
+                return resolveResult;
             }
 
             var arguments = GetArgumentValues(context.Schema, fieldDefinition.Arguments, field.Arguments, context.Variables);
 
-            Func<ResolveFieldContext, object> defaultResolve = (ctx) =>
-            {
-                return ctx.Source != null ? GetProperyValue(ctx.Source, ctx.FieldAst.Name) : null;
-            };
-
             try
             {
                 var resolveContext = new ResolveFieldContext();
+                resolveContext.FieldName = field.Name;
                 resolveContext.FieldAst = field;
                 resolveContext.FieldDefinition = fieldDefinition;
-                resolveContext.Schema = context.Schema;
+                resolveContext.ReturnType = fieldDefinition.ResolvedType;
                 resolveContext.ParentType = parentType;
                 resolveContext.Arguments = arguments;
                 resolveContext.Source = source;
-                var resolve = fieldDefinition.Resolve ?? defaultResolve;
-                var result = resolve(resolveContext);
+                resolveContext.Schema = context.Schema;
+                resolveContext.Document = context.Document;
+                resolveContext.Fragments = context.Fragments;
+                resolveContext.RootValue = context.RootValue;
+                resolveContext.UserContext = context.UserContext;
+                resolveContext.Operation = context.Operation;
+                resolveContext.Variables = context.Variables;
+                resolveContext.CancellationToken = context.CancellationToken;
+                resolveContext.Metrics = context.Metrics;
 
-                if(result is Task)
+                var resolver = fieldDefinition.Resolver ?? new NameFieldResolver();
+                var result = resolver.Resolve(resolveContext);
+
+                if (result is Task)
                 {
                     var task = result as Task;
-                    await task;
+                    await task.ConfigureAwait(false);
 
-                    result = GetProperyValue(task, "Result");
+                    result = task.GetProperyValue("Result");
                 }
 
-                if (parentType is __Field && result is Type)
-                {
-                    result = context.Schema.FindType(result as Type);
-                }
-
-                return await CompleteValue(context, context.Schema.FindType(fieldDefinition.Type), fields, result);
+                resolveResult.Value =
+                    await CompleteValueAsync(context, fieldDefinition.ResolvedType, fields, result).ConfigureAwait(false);
+                return resolveResult;
             }
             catch (Exception exc)
             {
-                context.Errors.Add(new ExecutionError("Error trying to resolve {0}.".ToFormat(field.Name), exc));
-                return null;
+                var error = new ExecutionError("Error trying to resolve {0}.".ToFormat(field.Name), exc);
+                error.AddLocation(field, context.Document);
+                context.Errors.Add(error);
+                resolveResult.Skip = false;
+                return resolveResult;
             }
         }
 
-        public object GetProperyValue(object obj, string propertyName)
+        public async Task<object> CompleteValueAsync(ExecutionContext context, IGraphType fieldType, Fields fields, object result)
         {
-            var val = obj.GetType()
-                .GetProperty(propertyName, BindingFlags.IgnoreCase | BindingFlags.Public | BindingFlags.Instance)
-                .GetValue(obj, null);
+            var field = fields != null ? fields.FirstOrDefault() : null;
+            var fieldName = field != null ? field.Name : null;
 
-            return val;
-        }
-
-        public async Task<object> CompleteValue(ExecutionContext context, GraphType fieldType, Fields fields, object result)
-        {
-            if (fieldType is NonNullGraphType)
+            var nonNullType = fieldType as NonNullGraphType;
+            if (nonNullType != null)
             {
-                var nonNullType = fieldType as NonNullGraphType;
-                var completed = await CompleteValue(context, context.Schema.FindType(nonNullType.Type), fields, result);
+                var type = nonNullType.ResolvedType;
+                var completed = await CompleteValueAsync(context, type, fields, result).ConfigureAwait(false);
                 if (completed == null)
                 {
-                    throw new ExecutionError("Cannot return null for non-null type. Field: {0}".ToFormat(nonNullType.Name));
+                    var error = new ExecutionError("Cannot return null for non-null type. Field: {0}, Type: {1}!."
+                        .ToFormat(fieldName, type.Name));
+                    error.AddLocation(field, context.Document);
+                    throw error;
                 }
 
                 return completed;
@@ -187,7 +359,7 @@ namespace GraphQL
             if (fieldType is ScalarGraphType)
             {
                 var scalarType = fieldType as ScalarGraphType;
-                var coercedValue = scalarType.Coerce(result);
+                var coercedValue = scalarType.Serialize(result);
                 return coercedValue;
             }
 
@@ -197,26 +369,34 @@ namespace GraphQL
 
                 if (list == null)
                 {
-                    throw new ExecutionError("User error: expected an IEnumerable list though did not find one.");
+                    var error = new ExecutionError("User error: expected an IEnumerable list though did not find one.");
+                    error.AddLocation(field, context.Document);
+                    throw error;
                 }
 
                 var listType = fieldType as ListGraphType;
-                var itemType = context.Schema.FindType(listType.Type);
+                var itemType = listType.ResolvedType;
 
-                var results = await list.MapAsync(async item =>
-                {
-                    return await CompleteValue(context, itemType, fields, item);
-                });
+                var results = await list.MapAsync(async item => await CompleteValueAsync(context, itemType, fields, item).ConfigureAwait(false)).ConfigureAwait(false);
 
                 return results;
             }
 
-            var objectType = fieldType as ObjectGraphType;
+            var objectType = fieldType as IObjectGraphType;
 
-            if (fieldType is InterfaceGraphType)
+            if (fieldType is IAbstractGraphType)
             {
-                var interfaceType = fieldType as InterfaceGraphType;
-                objectType = interfaceType.ResolveType(result);
+                var abstractType = fieldType as IAbstractGraphType;
+                objectType = abstractType.GetObjectType(result);
+
+                if (objectType != null && !abstractType.IsPossibleType(objectType))
+                {
+                    var error = new ExecutionError(
+                        "Runtime Object type \"{0}\" is not a possible type for \"{1}\""
+                        .ToFormat(objectType, abstractType));
+                    error.AddLocation(field, context.Document);
+                    throw error;
+                }
             }
 
             if (objectType == null)
@@ -224,17 +404,27 @@ namespace GraphQL
                 return null;
             }
 
-            var subFields = new Dictionary<string, Fields>();
-
-            fields.Apply(field =>
+            if (objectType.IsTypeOf != null && !objectType.IsTypeOf(result))
             {
-                subFields = CollectFields(context, objectType, field.Selections, subFields);
+                var error = new ExecutionError(
+                    "Expected value of type \"{0}\" but got: {1}."
+                    .ToFormat(objectType, result));
+                error.AddLocation(field, context.Document);
+                throw error;
+            }
+
+            var subFields = new Dictionary<string, Fields>();
+            var visitedFragments = new List<string>();
+
+            fields.Apply(f =>
+            {
+                subFields = CollectFields(context, objectType, f.SelectionSet, subFields, visitedFragments);
             });
 
-            return await ExecuteFields(context, objectType, result, subFields);
+            return await ExecuteFieldsAsync(context, objectType, result, subFields).ConfigureAwait(false);
         }
 
-        public Dictionary<string, object> GetArgumentValues(Schema schema, QueryArguments definitionArguments, Arguments astArguments, Variables variables)
+        public Dictionary<string, object> GetArgumentValues(ISchema schema, QueryArguments definitionArguments, Arguments astArguments, Variables variables)
         {
             if (definitionArguments == null || !definitionArguments.Any())
             {
@@ -243,14 +433,18 @@ namespace GraphQL
 
             return definitionArguments.Aggregate(new Dictionary<string, object>(), (acc, arg) =>
             {
-                var value = astArguments != null ? astArguments.ValueFor(arg.Name) : null;
-                var coercedValue = CoerceValueAst(schema, schema.FindType(arg.Type), value, variables);
-                acc[arg.Name] = coercedValue ?? arg.DefaultValue;
+                var value = astArguments?.ValueFor(arg.Name);
+                var type = arg.ResolvedType;
+
+                var coercedValue = CoerceValue(schema, type, value, variables);
+                coercedValue = coercedValue ?? arg.DefaultValue;
+                acc[arg.Name] = coercedValue;
+
                 return acc;
             });
         }
 
-        public FieldType GetFieldDefinition(Schema schema, ObjectGraphType parentType, Field field)
+        public FieldType GetFieldDefinition(ISchema schema, IObjectGraphType parentType, Field field)
         {
             if (field.Name == SchemaIntrospection.SchemaMeta.Name && schema.Query == parentType)
             {
@@ -268,9 +462,11 @@ namespace GraphQL
             return parentType.Fields.FirstOrDefault(f => f.Name == field.Name);
         }
 
-        public ObjectGraphType GetOperationRootType(Schema schema, Operation operation)
+        public IObjectGraphType GetOperationRootType(Document document, ISchema schema, Operation operation)
         {
-            ObjectGraphType type;
+            IObjectGraphType type;
+
+            ExecutionError error;
 
             switch (operation.OperationType)
             {
@@ -280,45 +476,134 @@ namespace GraphQL
 
                 case OperationType.Mutation:
                     type = schema.Mutation;
+                    if (type == null)
+                    {
+                        error = new ExecutionError("Schema is not configured for mutations");
+                        error.AddLocation(operation, document);
+                        throw error;
+                    }
+                    break;
+
+                case OperationType.Subscription:
+                    type = schema.Subscription;
+                    if (type == null)
+                    {
+                        error = new ExecutionError("Schema is not configured for subscriptions");
+                        error.AddLocation(operation, document);
+                        throw error;
+                    }
                     break;
 
                 default:
-                    throw new InvalidOperationException("Can only execute queries and mutations");
+                    error = new ExecutionError("Can only execute queries, mutations and subscriptions.");
+                    error.AddLocation(operation, document);
+                    throw error;
             }
 
             return type;
         }
 
-        public Variables GetVariableValues(Schema schema, Variables variables, Inputs inputs)
+        public Variables GetVariableValues(Document document, ISchema schema, VariableDefinitions variableDefinitions, Inputs inputs)
         {
-            if (inputs != null)
+            var variables = new Variables();
+            variableDefinitions.Apply(v =>
             {
-                variables.Apply(v =>
-                {
-                    v.Value = GetVariableValue(schema, v, inputs[v.Name]);
-                });
-            }
+                var variable = new Variable();
+                variable.Name = v.Name;
 
+                object variableValue = null;
+                inputs?.TryGetValue(v.Name, out variableValue);
+                variable.Value = GetVariableValue(document, schema, v, variableValue);
+
+                variables.Add(variable);
+            });
             return variables;
         }
 
-        public object GetVariableValue(Schema schema, Variable variable, object input)
+        public object GetVariableValue(Document document, ISchema schema, VariableDefinition variable, object input)
         {
-            var type = schema.FindType(variable.Type.Name);
+            var type = variable.Type.GraphTypeFromType(schema);
+
             if (IsValidValue(schema, type, input))
             {
-                if (input == null && variable.DefaultValue != null)
+                if (input == null)
                 {
-                    return CoerceValueAst(schema, type, variable.DefaultValue, null);
+                    if (variable.DefaultValue != null)
+                    {
+                        return ValueFromAst(variable.DefaultValue);
+                    }
                 }
-
-                return CoerceValue(schema, type, input);
+                var coercedValue = CoerceValue(schema, type, input.AstFromValue(schema, type));
+                return coercedValue;
             }
 
-            throw new Exception("Variable {0} expected type '{1}'.".ToFormat(variable.Name, type.Name));
+            if (input == null)
+            {
+                var error2 = new ExecutionError("Variable '${0}' of required type '{1}' was not provided.".ToFormat(variable.Name, type.Name ?? variable.Type.FullName()));
+                error2.AddLocation(variable, document);
+                throw error2;
+            }
+
+            var error = new ExecutionError("Variable '${0}' expected value of type '{1}'.".ToFormat(variable.Name, type?.Name ?? variable.Type.FullName()));
+            error.AddLocation(variable, document);
+            throw error;
         }
 
-        public bool IsValidValue(Schema schema, GraphType type, object input)
+        private object ValueFromAst(IValue value)
+        {
+            if (value == null)
+            {
+                return null;
+            }
+
+            if (value is StringValue)
+            {
+                var str = (StringValue)value;
+                return str.Value;
+            }
+
+            if (value is IntValue)
+            {
+                var num = (IntValue)value;
+                return num.Value;
+            }
+
+            if (value is LongValue)
+            {
+                var num = (LongValue)value;
+                return num.Value;
+            }
+
+            if (value is FloatValue)
+            {
+                var num = (FloatValue)value;
+                return num.Value;
+            }
+
+            if (value is EnumValue)
+            {
+                var @enum = (EnumValue)value;
+                return @enum.Name;
+            }
+
+            if (value is ObjectValue)
+            {
+                var objVal = (ObjectValue)value;
+                var obj = new Dictionary<string, object>();
+                objVal.FieldNames.Apply(name => obj.Add(name, ValueFromAst(objVal.Field(name).Value)));
+                return obj;
+            }
+
+            if (value is ListValue)
+            {
+                var list = (ListValue)value;
+                return list.Values.Select(ValueFromAst).ToList();
+            }
+
+            return null;
+        }
+
+        public bool IsValidValue(ISchema schema, IGraphType type, object input)
         {
             if (type is NonNullGraphType)
             {
@@ -327,7 +612,15 @@ namespace GraphQL
                     return false;
                 }
 
-                return IsValidValue(schema, schema.FindType(((NonNullGraphType)type).Type), input);
+                var nonNullType = ((NonNullGraphType)type).ResolvedType;
+
+                if (nonNullType is ScalarGraphType)
+                {
+                    var val = ValueFromScalar((ScalarGraphType)nonNullType, input);
+                    return val != null;
+                }
+
+                return IsValidValue(schema, nonNullType, input);
             }
 
             if (input == null)
@@ -337,81 +630,72 @@ namespace GraphQL
 
             if (type is ListGraphType)
             {
-                var listType = (ListGraphType) type;
+                var listType = (ListGraphType)type;
+                var listItemType = listType.ResolvedType;
+
                 var list = input as IEnumerable;
-                return list != null
-                    ? list.All(item => IsValidValue(schema, type, item))
-                    : IsValidValue(schema, listType, input);
+                if (list != null && !(input is string))
+                {
+                    return list.All(item => IsValidValue(schema, listItemType, item));
+                }
+
+                return IsValidValue(schema, listItemType, input);
             }
 
-            if (type is ObjectGraphType)
+            if (type is IObjectGraphType || type is InputObjectGraphType)
             {
                 var dict = input as Dictionary<string, object>;
-                return dict != null
-                    && type.Fields.All(field => IsValidValue(schema, schema.FindType(field.Type), dict[field.Name]));
-            }
+                var complexType = type as IComplexGraphType;
 
-            if (type is ScalarGraphType)
-            {
-                var scalar = (ScalarGraphType) type;
-                return scalar.Coerce(input) != null;
-            }
-
-            return false;
-        }
-
-        // TODO: combine dupliation with CoerceValueAST
-        public object CoerceValue(Schema schema, GraphType type, object input)
-        {
-            if (type is NonNullGraphType)
-            {
-                var nonNull = type as NonNullGraphType;
-                return CoerceValue(schema, schema.FindType(nonNull.Type), input);
-            }
-
-            if (input == null)
-            {
-                return null;
-            }
-
-            if (type is ListGraphType)
-            {
-                var listType = type as ListGraphType;
-                var list = input as IEnumerable;
-                return list != null
-                    ? list.Map(item => CoerceValue(schema, listType, item))
-                    : new[] { input };
-            }
-
-            if (type is ObjectGraphType)
-            {
-                var objType = type as ObjectGraphType;
-                var obj = new Dictionary<string, object>();
-                var dict = (Dictionary<string, object>)input;
-
-                objType.Fields.Apply(field =>
+                if (dict == null)
                 {
-                    var fieldValue = CoerceValue(schema, schema.FindType(field.Type), dict[field.Name]);
-                    obj[field.Name] = fieldValue ?? field.DefaultValue;
+                    return false;
+                }
+
+                // ensure every provided field is defined
+                if (type is InputObjectGraphType
+                    && dict.Keys.Any(key => complexType.Fields.FirstOrDefault(field => field.Name == key) == null))
+                {
+                    return false;
+                }
+
+                return complexType.Fields.All(field =>
+                {
+                    object fieldValue = null;
+                    dict.TryGetValue(field.Name, out fieldValue);
+                    return IsValidValue(
+                        schema,
+                        field.ResolvedType,
+                        fieldValue);
                 });
             }
 
             if (type is ScalarGraphType)
             {
-                var scalarType = type as ScalarGraphType;
-                return scalarType.Coerce(input);
+                var scalar = (ScalarGraphType)type;
+                var value = ValueFromScalar(scalar, input);
+                return value != null;
             }
 
-            return null;
+            return false;
         }
 
-        // TODO: combine duplication with CoerceValue
-        public object CoerceValueAst(Schema schema, GraphType type, object input, Variables variables)
+        private object ValueFromScalar(ScalarGraphType scalar, object input)
+        {
+            if (input is IValue)
+            {
+                return scalar.ParseLiteral((IValue)input);
+            }
+
+            return scalar.ParseValue(input);
+        }
+
+        public object CoerceValue(ISchema schema, IGraphType type, IValue input, Variables variables = null)
         {
             if (type is NonNullGraphType)
             {
                 var nonNull = type as NonNullGraphType;
-                return CoerceValueAst(schema, schema.FindType(nonNull.Type), input, variables);
+                return CoerceValue(schema, nonNull.ResolvedType, input, variables);
             }
 
             if (input == null)
@@ -419,99 +703,123 @@ namespace GraphQL
                 return null;
             }
 
-            if (input is Variable)
+            var variable = input as VariableReference;
+            if (variable != null)
             {
                 return variables != null
-                    ? variables.ValueFor(((Variable)input).Name)
+                    ? variables.ValueFor(variable.Name)
                     : null;
             }
 
             if (type is ListGraphType)
             {
                 var listType = type as ListGraphType;
-                var list = input as IEnumerable;
+                var listItemType = listType.ResolvedType;
+                var list = input as ListValue;
                 return list != null
-                    ? list.Map(item => CoerceValueAst(schema, listType, item, variables))
-                    : new[] { input };
+                    ? list.Values.Map(item => CoerceValue(schema, listItemType, item, variables)).ToArray()
+                    : new[] { CoerceValue(schema, listItemType, input, variables) };
             }
 
-            if (type is ObjectGraphType)
+            if (type is IObjectGraphType || type is InputObjectGraphType)
             {
-                var objType = type as ObjectGraphType;
+                var complexType = type as IComplexGraphType;
                 var obj = new Dictionary<string, object>();
-                var dict = (Dictionary<string, object>)input;
 
-                objType.Fields.Apply(field =>
+                var objectValue = input as ObjectValue;
+                if (objectValue == null)
                 {
-                    var fieldValue = CoerceValueAst(schema, schema.FindType(field.Type), dict[field.Name], variables);
-                    obj[field.Name] = fieldValue ?? field.DefaultValue;
+                    return null;
+                }
+
+                complexType.Fields.Apply(field =>
+                {
+                    var objectField = objectValue.Field(field.Name);
+                    if (objectField != null)
+                    {
+                        var fieldValue = CoerceValue(schema, field.ResolvedType, objectField.Value, variables);
+                        fieldValue = fieldValue ?? field.DefaultValue;
+
+                        obj[field.Name] = fieldValue;
+                    }
                 });
+
+                return obj;
             }
 
             if (type is ScalarGraphType)
             {
                 var scalarType = type as ScalarGraphType;
-                return scalarType.Coerce(input);
+                return scalarType.ParseLiteral(input);
             }
 
-            return input;
+            return null;
         }
 
-        public Dictionary<string, Fields> CollectFields(ExecutionContext context, GraphType type, Selections selections, Dictionary<string, Fields> fields)
+        public Dictionary<string, Fields> CollectFields(
+            ExecutionContext context,
+            IGraphType specificType,
+            SelectionSet selectionSet,
+            Dictionary<string, Fields> fields,
+            List<string> visitedFragmentNames)
         {
             if (fields == null)
             {
                 fields = new Dictionary<string, Fields>();
             }
 
-            selections.Apply(selection =>
+            selectionSet.Selections.Apply(selection =>
             {
-                if (selection.Field != null)
+                if (selection is Field)
                 {
-                    if (!ShouldIncludeNode(context, selection.Field.Directives))
+                    var field = (Field)selection;
+                    if (!ShouldIncludeNode(context, field.Directives))
                     {
                         return;
                     }
 
-                    var name = selection.Field.Alias ?? selection.Field.Name;
+                    var name = field.Alias ?? field.Name;
                     if (!fields.ContainsKey(name))
                     {
                         fields[name] = new Fields();
                     }
-                    fields[name].Add(selection.Field);
+                    fields[name].Add(field);
                 }
-                else if (selection.Fragment != null)
+                else if (selection is FragmentSpread)
                 {
-                    if (selection.Fragment is FragmentSpread)
+                    var spread = (FragmentSpread)selection;
+
+                    if (visitedFragmentNames.Contains(spread.Name)
+                        || !ShouldIncludeNode(context, spread.Directives))
                     {
-                        var spread = selection.Fragment as FragmentSpread;
-
-                        if (!ShouldIncludeNode(context, spread.Directives))
-                        {
-                            return;
-                        }
-
-                        var fragment = context.Fragments.FindDefinition(spread.Name);
-                        if (!ShouldIncludeNode(context, fragment.Directives)
-                            || !DoesFragmentConditionMatch(context, fragment, type))
-                        {
-                            return;
-                        }
-
-                        CollectFields(context, type, fragment.Selections, fields);
+                        return;
                     }
-                    else if (selection.Fragment is InlineFragment)
+
+                    visitedFragmentNames.Add(spread.Name);
+
+                    var fragment = context.Fragments.FindDefinition(spread.Name);
+                    if (fragment == null
+                        || !ShouldIncludeNode(context, fragment.Directives)
+                        || !DoesFragmentConditionMatch(context, fragment.Type.Name, specificType))
                     {
-                        var inline = selection.Fragment as InlineFragment;
-
-                        if (!ShouldIncludeNode(context, inline.Directives)
-                          || !DoesFragmentConditionMatch(context, inline, type))
-                        {
-                            return;
-                        }
-
-                        CollectFields(context, type, inline.Selections, fields);
+                        return;
                     }
+
+                    CollectFields(context, specificType, fragment.SelectionSet, fields, visitedFragmentNames);
+                }
+                else if (selection is InlineFragment)
+                {
+                    var inline = (InlineFragment)selection;
+
+                    var name = inline.Type != null ? inline.Type.Name : specificType.Name;
+
+                    if (!ShouldIncludeNode(context, inline.Directives)
+                      || !DoesFragmentConditionMatch(context, name, specificType))
+                    {
+                        return;
+                    }
+
+                    CollectFields(context, specificType, inline.SelectionSet, fields, visitedFragmentNames);
                 }
             });
 
@@ -530,7 +838,12 @@ namespace GraphQL
                         DirectiveGraphType.Skip.Arguments,
                         directive.Arguments,
                         context.Variables);
-                    return !((bool) values["if"]);
+
+                    object ifObj;
+                    values.TryGetValue("if", out ifObj);
+
+                    bool ifVal;
+                    return !(bool.TryParse(ifObj?.ToString() ?? string.Empty, out ifVal) && ifVal);
                 }
 
                 directive = directives.Find(DirectiveGraphType.Include.Name);
@@ -541,30 +854,41 @@ namespace GraphQL
                         DirectiveGraphType.Include.Arguments,
                         directive.Arguments,
                         context.Variables);
-                    return (bool) values["if"];
+
+                    object ifObj;
+                    values.TryGetValue("if", out ifObj);
+
+                    bool ifVal;
+                    return bool.TryParse(ifObj?.ToString() ?? string.Empty, out ifVal) && ifVal;
                 }
             }
 
             return true;
         }
 
-        public bool DoesFragmentConditionMatch(ExecutionContext context, IHaveFragmentType fragment, GraphType type)
+        public bool DoesFragmentConditionMatch(ExecutionContext context, string fragmentName, IGraphType type)
         {
-            var conditionalType = context.Schema.FindType(fragment.Type);
-            if (conditionalType == type)
+            if (string.IsNullOrWhiteSpace(fragmentName))
             {
                 return true;
             }
 
-            if (conditionalType is InterfaceGraphType)
+            var conditionalType = context.Schema.FindType(fragmentName);
+
+            if (conditionalType == null)
             {
-                var interfaceType = (InterfaceGraphType) conditionalType;
-                var hasInterfaces = type as IImplementInterfaces;
-                if (hasInterfaces != null)
-                {
-                    var interfaces = context.Schema.FindTypes(hasInterfaces.Interfaces);
-                    return interfaceType.IsPossibleType(interfaces);
-                }
+                return false;
+            }
+
+            if (conditionalType.Equals(type))
+            {
+                return true;
+            }
+
+            if (conditionalType is IAbstractGraphType)
+            {
+                var abstractType = (IAbstractGraphType)conditionalType;
+                return abstractType.IsPossibleType(type);
             }
 
             return false;

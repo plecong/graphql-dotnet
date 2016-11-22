@@ -1,29 +1,31 @@
-using System.Collections.Generic;
 using System.Linq;
 using GraphQL.Types;
 
 namespace GraphQL.Introspection
 {
-    public class __Field : ObjectGraphType
+    public class __Field : ObjectGraphType<IFieldType>
     {
         public __Field()
         {
             Name = "__Field";
-            Field<NonNullGraphType<StringGraphType>>("name");
-            Field<StringGraphType>("description");
-            Field<NonNullGraphType<ListGraphType<__InputValue>>>("args", null, null,
+            Description =
+                "Object and Interface types are described by a list of Fields, each of " +
+                "which has a name, potentially a list of arguments, and a return type.";
+
+            Field(f => f.Name);
+            Field(f => f.Description, nullable: true);
+
+            Field<NonNullGraphType<ListGraphType<NonNullGraphType<__InputValue>>>>("args", null, null,
                 context =>
                 {
-                    var fieldType = (FieldType) context.Source;
-                    return fieldType.Arguments ?? Enumerable.Empty<QueryArgument>();
+                    return context.Source.Arguments ?? Enumerable.Empty<QueryArgument>();
                 });
-            Field<NonNullGraphType<__Type>>("type");
+            Field<NonNullGraphType<__Type>>("type", resolve: ctx => ctx.Source.ResolvedType);
             Field<NonNullGraphType<BooleanGraphType>>("isDeprecated", null, null, context =>
             {
-                var fieldType = (FieldType) context.Source;
-                return !string.IsNullOrWhiteSpace(fieldType.DeprecationReason);
+                return !string.IsNullOrWhiteSpace(context.Source.DeprecationReason);
             });
-            Field<StringGraphType>("deprecationReason");
+            Field(f => f.DeprecationReason, nullable: true);
         }
     }
 }

@@ -1,5 +1,6 @@
 ﻿using GraphQL.Types;
-using Should;
+using Shouldly;
+using Xunit;
 
 namespace GraphQL.Tests.Types
 {
@@ -7,40 +8,40 @@ namespace GraphQL.Tests.Types
     {
         private BooleanGraphType type = new BooleanGraphType();
 
-        [Test]
+        [Fact]
         public void coerces_0_to_false()
         {
-            type.Coerce(0).ShouldEqual(false);
+            type.ParseValue(0).ShouldBe(false);
         }
 
-        [Test]
+        [Fact]
         public void coerces_1_to_true()
         {
-            type.Coerce(1).ShouldEqual(true);
+            type.ParseValue(1).ShouldBe(true);
         }
 
-        [Test]
+        [Fact]
         public void coerces_string_false()
         {
-            type.Coerce("false").ShouldEqual(false);
+            type.ParseValue("false").ShouldBe(false);
         }
 
-        [Test]
+        [Fact]
         public void coerces_string_False()
         {
-            type.Coerce("False").ShouldEqual(false);
+            type.ParseValue("False").ShouldBe(false);
         }
 
-        [Test]
+        [Fact]
         public void coerces_string_true()
         {
-            type.Coerce("true").ShouldEqual(true);
+            type.ParseValue("true").ShouldBe(true);
         }
 
-        [Test]
+        [Fact]
         public void coerces_string_True()
         {
-            type.Coerce("True").ShouldEqual(true);
+            type.ParseValue("True").ShouldBe(true);
         }
     }
 }

@@ -1,63 +1,148 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
 using GraphQL.Execution;
 using GraphQL.Http;
+using GraphQL.StarWars.IoC;
 using GraphQL.Types;
 using GraphQL.Validation;
-using Newtonsoft.Json;
+using GraphQL.Validation.Complexity;
+using GraphQLParser.Exceptions;
 using Newtonsoft.Json.Linq;
-using Should;
+using Shouldly;
 
 namespace GraphQL.Tests
 {
-    public class QueryTestBase<TSchema> : QueryTestBase<TSchema, AntlrDocumentBuilder>
-        where TSchema : Schema, new()
+    public class QueryTestBase<TSchema> : QueryTestBase<TSchema, GraphQLDocumentBuilder>
+        where TSchema : ISchema
     {
     }
 
     public class QueryTestBase<TSchema, TDocumentBuilder>
-        where TSchema : Schema, new()
+        where TSchema : ISchema
         where TDocumentBuilder : IDocumentBuilder, new()
     {
         public QueryTestBase()
         {
-            Schema = new TSchema();
-            Executer = new DocumentExecuter(new TDocumentBuilder(), new DocumentValidator());
-            Writer = new DocumentWriter(Formatting.Indented);
+            Services = new SimpleContainer();
+            Executer = new DocumentExecuter(new TDocumentBuilder(), new DocumentValidator(), new ComplexityAnalyzer());
+            Writer = new DocumentWriter(indent: true);
         }
 
-        public TSchema Schema { get; private set; }
+        public ISimpleContainer Services { get; set; }
+
+        public TSchema Schema
+        {
+            get { return Services.Get<TSchema>(); }
+        }
 
         public IDocumentExecuter Executer { get; private set; }
 
         public IDocumentWriter Writer { get; private set; }
 
-        public void AssertQuerySuccess(string query, string expected, Inputs inputs = null, object root = null)
+        public ExecutionResult AssertQuerySuccess(
+            string query,
+            string expected,
+            Inputs inputs = null,
+            object root = null,
+            object userContext = null,
+            CancellationToken cancellationToken = default(CancellationToken),
+            IEnumerable<IValidationRule> rules = null)
         {
             var queryResult = CreateQueryResult(expected);
-            AssertQuery(query, queryResult, inputs, root);
+            return AssertQuery(query, queryResult, inputs, root, userContext, cancellationToken, rules);
         }
 
-        public void AssertQuery(string query, ExecutionResult executionResult, Inputs inputs, object root)
+        public ExecutionResult AssertQueryWithErrors(
+            string query,
+            string expected,
+            Inputs inputs = null,
+            object root = null,
+            object userContext = null,
+            CancellationToken cancellationToken = default(CancellationToken),
+            int expectedErrorCount = 0)
         {
-            var runResult = Executer.ExecuteAsync(Schema, root, query, null, inputs).Result;
+            var queryResult = CreateQueryResult(expected);
+            return AssertQueryIgnoreErrors(query, queryResult, inputs, root, userContext, cancellationToken, expectedErrorCount);
+        }
+
+        public ExecutionResult AssertQueryIgnoreErrors(
+            string query,
+            ExecutionResult expectedExecutionResult,
+            Inputs inputs,
+            object root,
+            object userContext = null,
+            CancellationToken cancellationToken = default(CancellationToken),
+            int expectedErrorCount = 0)
+        {
+            var runResult = Executer.ExecuteAsync(Schema, root, query, null, inputs, userContext, cancellationToken).Result;
+
+            var writtenResult = Writer.Write(new ExecutionResult { Data = runResult.Data });
+            var expectedResult = Writer.Write(expectedExecutionResult);
+
+// #if DEBUG
+//             Console.WriteLine(writtenResult);
+// #endif
+
+            writtenResult.ShouldBe(expectedResult);
+
+            var errors = runResult.Errors ?? new ExecutionErrors();
+
+            errors.Count().ShouldBe(expectedErrorCount);
+
+            return runResult;
+        }
+
+        public ExecutionResult AssertQuery(
+            string query,
+            ExecutionResult expectedExecutionResult,
+            Inputs inputs,
+            object root,
+            object userContext = null,
+            CancellationToken cancellationToken = default(CancellationToken),
+            IEnumerable<IValidationRule> rules = null)
+        {
+            var runResult = Executer.ExecuteAsync(
+                Schema,
+                root,
+                query,
+                null,
+                inputs,
+                userContext,
+                cancellationToken,
+                rules
+                ).Result;
 
             var writtenResult = Writer.Write(runResult);
-            var expectedResult = Writer.Write(executionResult);
+            var expectedResult = Writer.Write(expectedExecutionResult);
 
-            Console.WriteLine(writtenResult);
+// #if DEBUG
+//             Console.WriteLine(writtenResult);
+// #endif
 
-            writtenResult.ShouldEqual(expectedResult);
+            string additionalInfo = null;
+
+            if (runResult.Errors?.Any() == true)
+            {
+                additionalInfo = string.Join(Environment.NewLine, runResult.Errors
+                    .Where(x => x.InnerException is GraphQLSyntaxErrorException)
+                    .Select(x => x.InnerException.Message));
+            }
+
+            writtenResult.ShouldBe(expectedResult, additionalInfo);
+
+            return runResult;
         }
 
         public ExecutionResult CreateQueryResult(string result)
         {
-            var expected = JObject.Parse(result);
-            return new ExecutionResult { Data = expected, Errors = new ExecutionErrors()};
-        }
-
-        public ExecutionResult CreateErrorQueryResult()
-        {
-            return new ExecutionResult();
+            object expected = null;
+            if (!string.IsNullOrWhiteSpace(result))
+            {
+                expected = JObject.Parse(result);
+            }
+            return new ExecutionResult { Data = expected };
         }
     }
 }

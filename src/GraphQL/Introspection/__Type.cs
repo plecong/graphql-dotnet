@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Reflection;
 using GraphQL.Types;
 
 namespace GraphQL.Introspection
@@ -9,119 +10,104 @@ namespace GraphQL.Introspection
         public __Type()
         {
             Name = "__Type";
+            Description =
+                "The fundamental unit of any GraphQL Schema is the type. There are " +
+                "many kinds of types in GraphQL as represented by the `__TypeKind` enum." +
+                $"{Environment.NewLine}{Environment.NewLine}Depending on the kind of a type, certain fields describe " +
+                "information about that type. Scalar types provide no information " +
+                "beyond a name and description, while Enum types provide their values. " +
+                "Object and Interface types provide the fields they describe. Abstract " +
+                "types, Union and Interface, provide the Object types possible " +
+                "at runtime. List and NonNull types compose other types.";
             Field<NonNullGraphType<__TypeKind>>("kind", null, null, context =>
             {
                 if (context.Source is GraphType)
                 {
                     return KindForInstance((GraphType)context.Source);
                 }
-                else if (context.Source is Type)
-                {
-                    return KindForType((Type)context.Source);
-                }
+//                if (context.Source is Type)
+//                {
+//                    return KindForType((Type)context.Source);
+//                }
 
                 throw new ExecutionError("Unkown kind of type: {0}".ToFormat(context.Source));
             });
             Field<StringGraphType>("name", resolve: context =>
             {
-                if (context.Source is Type)
-                {
-                    var type = (Type) context.Source;
-
-                    if (typeof (NonNullGraphType).IsAssignableFrom(type)
-                        || typeof (ListGraphType).IsAssignableFrom(type))
-                    {
-                        return null;
-                    }
-
-                    var resolved = context.Schema.FindType(type);
-                    return resolved.Name;
-                }
-
-                return ((GraphType) context.Source).Name;
+                return ((IGraphType) context.Source).Name;
             });
             Field<StringGraphType>("description");
             Field<ListGraphType<NonNullGraphType<__Field>>>("fields", null,
-                new QueryArguments(new[]
-                {
+                new QueryArguments(
                     new QueryArgument<BooleanGraphType>
                     {
                         Name = "includeDeprecated",
                         DefaultValue = false
-                    }
-                }),
+                    }),
                 context =>
                 {
-                    if (context.Source is ObjectGraphType || context.Source is InterfaceGraphType)
+                    if (context.Source is IObjectGraphType || context.Source is IInterfaceGraphType)
                     {
-                        var includeDeprecated = (bool)context.Arguments["includeDeprecated"];
-                        var type = context.Source as GraphType;
+                        var includeDeprecated = context.GetArgument<bool>("includeDeprecated");
+                        var type = context.Source as IComplexGraphType;
                         return !includeDeprecated
-                            ? type.Fields.Where(f => string.IsNullOrWhiteSpace(f.DeprecationReason))
-                            : type.Fields;
+                            ? type?.Fields.Where(f => string.IsNullOrWhiteSpace(f.DeprecationReason))
+                            : type?.Fields;
                     }
-
-                    return Enumerable.Empty<FieldType>();
+                    return null;
                 });
             Field<ListGraphType<NonNullGraphType<__Type>>>("interfaces", resolve: context =>
             {
                 var type = context.Source as IImplementInterfaces;
-                return type != null ? type.Interfaces : Enumerable.Empty<Type>();
+                return type?.ResolvedInterfaces;
             });
             Field<ListGraphType<NonNullGraphType<__Type>>>("possibleTypes", resolve: context =>
             {
-                if (context.Source is InterfaceGraphType || context.Source is UnionGraphType)
+                if (context.Source is IAbstractGraphType)
                 {
-                    var type = (GraphType)context.Source;
-                    return context.Schema.FindImplemenationsOf(type.GetType());
+                    var type = (IAbstractGraphType)context.Source;
+                    return type.PossibleTypes;
                 }
-                return Enumerable.Empty<GraphType>();
+
+                return null;
             });
             Field<ListGraphType<NonNullGraphType<__EnumValue>>>("enumValues", null,
-                new QueryArguments(new[]
+                new QueryArguments(new QueryArgument<BooleanGraphType>
                 {
-                    new QueryArgument<BooleanGraphType>
-                    {
-                        Name = "includeDeprecated",
-                        DefaultValue = false
-                    }
+                    Name = "includeDeprecated",
+                    DefaultValue = false
                 }),
                 context =>
                 {
                     var type = context.Source as EnumerationGraphType;
                     if (type != null)
                     {
-                        var includeDeprecated = (bool)context.Arguments["includeDeprecated"];
+                        var includeDeprecated = context.GetArgument<bool>("includeDeprecated");
                         var values = !includeDeprecated
                             ? type.Values.Where(e => string.IsNullOrWhiteSpace(e.DeprecationReason)).ToList()
                             : type.Values.ToList();
                         return values;
                     }
 
-                    return Enumerable.Empty<EnumValue>();
+                    return null;
                 });
             Field<ListGraphType<NonNullGraphType<__InputValue>>>("inputFields", resolve: context =>
             {
                 var type = context.Source as InputObjectGraphType;
-                return type != null ? type.Fields : Enumerable.Empty<FieldType>();
+                return type?.Fields;
             });
             Field<__Type>("ofType", resolve: context =>
             {
-                if (context.Source is Type)
-                {
-                    var type = (Type) context.Source;
-                    var genericType = type.IsConstructedGenericType ? type.GetGenericArguments()[0] : null;
-                    return genericType;
-                }
+                if (context.Source == null) return null;
 
                 if (context.Source is NonNullGraphType)
                 {
-                    return ((NonNullGraphType) context.Source).Type;
+                    return ((NonNullGraphType) context.Source).ResolvedType;
                 }
 
                 if (context.Source is ListGraphType)
                 {
-                    return ((ListGraphType) context.Source).Type;
+                    return ((ListGraphType) context.Source).ResolvedType;
                 }
 
                 return null;
@@ -138,11 +124,11 @@ namespace GraphQL.Introspection
             {
                 return TypeKind.SCALAR;
             }
-            if (type is ObjectGraphType)
+            if (type is IObjectGraphType)
             {
                 return TypeKind.OBJECT;
             }
-            if (type is InterfaceGraphType)
+            if (type is IInterfaceGraphType)
             {
                 return TypeKind.INTERFACE;
             }
@@ -176,11 +162,11 @@ namespace GraphQL.Introspection
             {
                 return TypeKind.SCALAR;
             }
-            if (typeof(ObjectGraphType).IsAssignableFrom(type))
+            if (typeof(IObjectGraphType).IsAssignableFrom(type))
             {
                 return TypeKind.OBJECT;
             }
-            if (typeof(InterfaceGraphType).IsAssignableFrom(type))
+            if (typeof(IInterfaceGraphType).IsAssignableFrom(type))
             {
                 return TypeKind.INTERFACE;
             }

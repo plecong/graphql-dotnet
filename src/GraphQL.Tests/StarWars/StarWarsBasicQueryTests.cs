@@ -1,8 +1,10 @@
-namespace GraphQL.Tests
+using Xunit;
+
+namespace GraphQL.Tests.StarWars
 {
-    public class StarWarsBasicQueryTests : QueryTestBase<StarWarsSchema>
+    public class StarWarsBasicQueryTests : StarWarsTestBase
     {
-        [Test]
+        [Fact]
         public void identifies_r2_as_the_hero()
         {
             var query = @"
@@ -14,15 +16,15 @@ namespace GraphQL.Tests
             ";
 
             var expected = @"{
-  hero: {
-    name: 'R2-D2'
-  }
-}";
+              hero: {
+                name: 'R2-D2'
+              }
+            }";
 
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void can_query_without_query_name()
         {
             var query = @"
@@ -34,15 +36,15 @@ namespace GraphQL.Tests
             ";
 
             var expected = @"{
-  hero: {
-    name: 'R2-D2'
-  }
-}";
+              hero: {
+                name: 'R2-D2'
+              }
+            }";
 
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void can_query_for_the_id_and_friends_of_r2()
         {
             var query = @"
@@ -58,24 +60,24 @@ namespace GraphQL.Tests
             ";
 
             var expected = @"{
-  hero: {
-    id: '3',
-    name: 'R2-D2',
-    friends: [
-      {
-        name: 'Luke',
-      },
-      {
-        name: 'C-3PO',
-      },
-    ]
-  }
-}";
+              hero: {
+                id: '3',
+                name: 'R2-D2',
+                friends: [
+                  {
+                    name: 'Luke',
+                  },
+                  {
+                    name: 'C-3PO',
+                  },
+                ]
+              }
+            }";
 
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void can_query_for_humans()
         {
             var query = @"
@@ -97,7 +99,7 @@ namespace GraphQL.Tests
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void can_query_for_friends_of_humans()
         {
             var query = @"
@@ -125,7 +127,7 @@ namespace GraphQL.Tests
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void can_query_for_droids()
         {
             var query = @"
@@ -137,15 +139,15 @@ namespace GraphQL.Tests
             ";
 
             var expected = @"{
-  droid: {
-    name: 'C-3PO'
-  }
-}";
+              droid: {
+                name: 'C-3PO'
+              }
+            }";
 
             AssertQuerySuccess(query, expected);
         }
 
-        [Test]
+        [Fact]
         public void create_generic_query_that_fetches_luke()
         {
             var query = @"
@@ -163,12 +165,12 @@ namespace GraphQL.Tests
             }
             ";
 
-            var inputs = new Inputs {["id"] = "1"};
+            var inputs = new Inputs {{"id", "1"}};
 
             AssertQuerySuccess(query, expected, inputs);
         }
 
-        [Test]
+        [Fact]
         public void query_same_root_field_using_alias()
         {
             var query = @"

@@ -1,4 +1,6 @@
-﻿using GraphQL.Language;
+﻿using System.Threading;
+using GraphQL.Instrumentation;
+using GraphQL.Language.AST;
 using GraphQL.Types;
 
 namespace GraphQL.Execution
@@ -11,9 +13,13 @@ namespace GraphQL.Execution
             Errors = new ExecutionErrors();
         }
 
-        public Schema Schema { get; set; }
+        public Document Document { get; set; }
 
-        public object RootObject { get; set; }
+        public ISchema Schema { get; set; }
+
+        public object RootValue { get; set; }
+
+        public object UserContext { get; set; }
 
         public Operation Operation { get; set; }
 
@@ -22,5 +28,9 @@ namespace GraphQL.Execution
         public Variables Variables { get; set; }
 
         public ExecutionErrors Errors { get; set; }
+
+        public CancellationToken CancellationToken { get; set; }
+
+        public Metrics Metrics { get; set; }
     }
 }
